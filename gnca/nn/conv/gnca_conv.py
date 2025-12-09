@@ -37,11 +37,12 @@ class GNCAConv(MessagePassing):
         in_channels (int): Input feature dimensionality (state size per node).
         out_channels (int): Output feature dimensionality.
         hidden_channels (int): Hidden layer size for message MLP. Default: 128.
-        aggr (str): Aggregation scheme ('add', 'mean', 'max'). Default: 'add'.
+        aggr (str): Aggregation scheme within message-passing('add', 'mean', 'max', 'cat'). Default: 'add'.
         persistence (bool): Whether to concatenate input state with aggregated
             messages. If True, output will be [h_i || aggregated_messages].
             Default: True.
-        mlp_layers (int): Number of layers in message MLP. Default: 2.
+        mlp_layers (int): Number of layers in message MLP. Default: 1.
+        mp_layers (int): Number of message passing layers. Default: 1.
         activation (str): Activation function ('relu', 'tanh', 'elu'). Default: 'relu'.
         batch_norm (bool): Apply batch normalization in MLP. Default: False.
         dropout (float): Dropout probability in MLP. Default: 0.0.
@@ -63,7 +64,8 @@ class GNCAConv(MessagePassing):
         hidden_channels: int = 128,
         aggr: str = 'add',
         persistence: bool = True,
-        mlp_layers: int = 2,
+        mlp_layers: int = 1,
+        mp_layers: int=1,
         activation: str = 'relu',
         batch_norm: bool = False,
         dropout: float = 0.0,
@@ -75,6 +77,7 @@ class GNCAConv(MessagePassing):
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.hidden_channels = hidden_channels
+        self.activation = activation
         self.persistence = persistence
         self.batch_norm = batch_norm
         self.dropout = dropout
@@ -121,12 +124,16 @@ class GNCAConv(MessagePassing):
                     mlp_layers_list.append(nn.Dropout(dropout))
 
             # Final layer: hidden_channels -> out_channels
-            mlp_layers_list.append(nn.Linear(hidden_channels, out_channels, bias=bias))
+            if persistence:
+                decoder = [(nn.Linear(2*hidden_channels, out_channels, bias=bias))]
+            else:
+                decoder = [(nn.Linear(hidden_channels, out_channels, bias=bias))]
             if batch_norm:
-                mlp_layers_list.append(nn.BatchNorm1d(out_channels))
-            mlp_layers_list.append(self.activation)
+                decoder.append((nn.BatchNorm1d(out_channels)))
+            decoder.append(self.activation)
 
-        self.message_mlp = nn.Sequential(*mlp_layers_list)
+        self.preproc_mlp = nn.Sequential(*mlp_layers_list)
+        self.decoder = nn.Sequential(*decoder)
 
         self.reset_parameters()
 
@@ -150,15 +157,20 @@ class GNCAConv(MessagePassing):
         Returns updated node features [num_nodes, out_channels] or
         [num_nodes, in_channels + out_channels] if persistence=True.
         """
+
+        x = self.preproc_mlp(x)
         # Store original state if persistence (concat) is enabled
-        x_orig = x if self.persistence else None
+        x_orig = x.clone() if self.persistence else None
 
         # Propagate messages: calls message(), aggregate(), and update()
-        out = self.propagate(edge_index, x=x, edge_weight=edge_weight)
+        for _ in range(self.mp_layers):
+            #Change mp_layers depending on k-hop neighborhood
+            x = self.propagate(edge_index, x=x, edge_weight=edge_weight)
 
         # If persistence, concatenate original state with aggregated messages
         if self.persistence:
             out = torch.cat([x_orig, out], dim=-1)
+        out = self.decoder(out) #Final post-processing MLP
 
         return out
 
@@ -171,8 +183,9 @@ class GNCAConv(MessagePassing):
 
         Returns tensor of messages to be aggregated [num_edges, out_channels]
         """
-        # Apply message MLP: ReLU(W h_j + b)
-        msg = self.message_mlp(x_j)
+        # Apply message MLP: sigmoid(W h_j + b) - not ReLU as ReLU not expressive enough for GCA
+        # the logic is that GCA almost always positive, so ReLU mostly amounts to nothing (sad :'[ )
+        msg = nn.sigmoid(self.message_mlp(x_j))
 
         # CAN ALSO weight messages by edge weights (not in paper)
         if edge_weight is not None:
