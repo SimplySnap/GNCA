@@ -4,6 +4,12 @@ from torch_geometric.typing import Adj, OptTensor
 from typing import Optional, Union
 
 
+from torch import Tensor
+from torch_geometric.nn.conv import MessagePassing
+from torch_geometric.typing import Adj, OptTensor
+from typing import Optional, Union
+
+
 class GNCAConv(MessagePassing):
     """
     Graph Neural Cellular Automata convolution layer.
@@ -119,11 +125,14 @@ class GNCAConv(MessagePassing):
         # Input dimension depends on `persistence`: hidden_channels (if no concat) or 2*hidden_channels (if concat).
         decoder_input_dim = hidden_channels * 2 if persistence else hidden_channels
         decoder_modules = []
-        for j in range(self.post_mlp_layers):
-            decoder_modules.append(nn.Linear(decoder_input_dim, out_channels, bias=bias))
+        for j in range(self.post_mlp_layers-1):
+            decoder_modules.append(nn.Linear(decoder_input_dim, decoder_input_dim, bias=bias))
             if batch_norm:
                 decoder_modules.append(nn.BatchNorm1d(out_channels))
-
+            message_mlp_modules.append(self.internal_activation)
+        if post_mlp_layers > 0:
+            decoder_modules.append(nn.Linear(decoder_input_dim,out_channels,bias=bias))
+        
         # Final activation for the decoder
         if out_channels == 1: # Typically Sigmoid for binary output
             decoder_modules.append(nn.Sigmoid())
@@ -243,6 +252,7 @@ class GNCAConv(MessagePassing):
             f'mp_layers={self.mp_layers}), '
             f'post-processing_mlp_layers={self.post_mlp_layers}'
         )
+    
     
 
 class GNCAConvSimple(MessagePassing):
