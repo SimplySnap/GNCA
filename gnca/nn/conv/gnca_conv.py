@@ -22,7 +22,7 @@ class GNCAConv(MessagePassing):
         persistence (bool): Whether to concatenate input state with aggregated
             messages. If True, output will be [h_i || aggregated_messages].
             Default: True.
-        mlp_layers (int): Number of layers in message MLP. Default: 1.
+        mlp_layers (int): Number of layers in pre-message passing MLP. Default: 1.
         mp_layers (int): Number of message passing layers. Default: 1.
         activation (str): Activation function ('relu', 'tanh', 'elu', 'sigmoid'). Default: 'relu'.
         batch_norm (bool): Apply batch normalization in MLP. Default: False.
@@ -45,8 +45,9 @@ class GNCAConv(MessagePassing):
         hidden_channels: int = 128,
         aggr: str = 'add',
         persistence: bool = True,
-        mlp_layers: int = 1,
+        pre_mlp_layers: int = 1,
         mp_layers: int=1,
+        post_mlp_layers : int = 1,
         activation: str = 'relu',
         batch_norm: bool = False,
         dropout: float = 0.0,
@@ -60,7 +61,8 @@ class GNCAConv(MessagePassing):
         self.hidden_channels = hidden_channels
         self.persistence = persistence
         self.mp_layers = mp_layers
-        self.mlp_layers = mlp_layers # Store for __repr__
+        self.pre_mlp_layers = pre_mlp_layers # Store for __repr__
+        self.post_mlp_layers = post_mlp_layers
 
         # Activation function for internal layers (applied manually where needed)
         if activation == 'relu':
@@ -91,24 +93,25 @@ class GNCAConv(MessagePassing):
         # is applied *after* this MLP in the `message` method.
         message_mlp_modules = []
         current_in_dim = hidden_channels
-        for i in range(mlp_layers):
+        for i in range(pre_mlp_layers):
             message_mlp_modules.append(nn.Linear(current_in_dim, hidden_channels, bias=bias))
             if batch_norm:
                 message_mlp_modules.append(nn.BatchNorm1d(hidden_channels))
-            if i < mlp_layers - 1: # Apply internal activation for all but the last linear layer
+            if i < pre_mlp_layers - 1: # Apply internal activation for all but the last linear layer
                 message_mlp_modules.append(self.internal_activation)
                 if dropout > 0: # Dropout typically applied after activation
                     message_mlp_modules.append(nn.Dropout(dropout))
-            elif dropout > 0 and mlp_layers == 1: # Apply dropout if it's the only layer and dropout is needed
+            elif dropout > 0 and pre_mlp_layers == 1: # Apply dropout if it's the only layer and dropout is needed
                 message_mlp_modules.append(nn.Dropout(dropout))
 
             current_in_dim = hidden_channels
 
-        # Ensure message_mlp is not empty if mlp_layers is 0 or logic creates an empty list
-        if not message_mlp_modules:
-            message_mlp_modules.append(nn.Linear(hidden_channels, hidden_channels, bias=bias))
-            if batch_norm:
-                message_mlp_modules.append(nn.BatchNorm1d(hidden_channels))
+        #Commented out because sometimes we WANT no preprocessing embedding
+        # Ensure message_mlp is not empty if pre_mlp_layers is 0 or logic creates an empty list
+        #if not message_mlp_modules:
+        #    message_mlp_modules.append(nn.Linear(hidden_channels, hidden_channels, bias=bias))
+        #    if batch_norm:
+        #        message_mlp_modules.append(nn.BatchNorm1d(hidden_channels))
 
         self.message_mlp = nn.Sequential(*message_mlp_modules)
 
@@ -116,9 +119,10 @@ class GNCAConv(MessagePassing):
         # Input dimension depends on `persistence`: hidden_channels (if no concat) or 2*hidden_channels (if concat).
         decoder_input_dim = hidden_channels * 2 if persistence else hidden_channels
         decoder_modules = []
-        decoder_modules.append(nn.Linear(decoder_input_dim, out_channels, bias=bias))
-        if batch_norm:
-            decoder_modules.append(nn.BatchNorm1d(out_channels))
+        for j in range(self.post_mlp_layers):
+            decoder_modules.append(nn.Linear(decoder_input_dim, out_channels, bias=bias))
+            if batch_norm:
+                decoder_modules.append(nn.BatchNorm1d(out_channels))
 
         # Final activation for the decoder
         if out_channels == 1: # Typically Sigmoid for binary output
@@ -235,6 +239,82 @@ class GNCAConv(MessagePassing):
             f'hidden_channels={self.hidden_channels}, '
             f'aggr={self.aggr}, '
             f'persistence={self.persistence}, '
-            f'mlp_layers={self.mlp_layers}, '
-            f'mp_layers={self.mp_layers})'
+            f'preprocessing_mlp_layers={self.pre_mlp_layers}, '
+            f'mp_layers={self.mp_layers}), '
+            f'post-processing_mlp_layers={self.post_mlp_layers}'
+        )
+    
+
+class GNCAConvSimple(MessagePassing):
+    """
+    Simplified GNCA convolution layer with minimal configuration.
+
+    This is a streamlined version of GNCAConv with fewer hyperparameters,
+    closer to the original paper's formulation. Good for quick experiments.
+
+    Args:
+        channels (int): Feature dimensionality (same for input and output).
+        hidden_channels (int): Hidden layer size. Default: 256.
+        aggr (str): Aggregation scheme. Default: 'add'.
+        persistence (bool): Enable state persistence. Default: True.
+
+    Example:
+        >>> conv = GNCAConvSimple(channels=16)
+        >>> x = torch.randn(100, 16)
+        >>> edge_index = torch.randint(0, 100, (2, 500))
+        >>> out = conv(x, edge_index)
+        >>> out.shape
+        torch.Size([100, 32])  # 16 + 16 with persistence
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        hidden_channels: int = 256,
+        aggr: str = 'add',
+        persistence: bool = True,
+        **kwargs
+    ):
+        super().__init__(aggr=aggr, **kwargs)
+
+        self.channels = channels
+        self.hidden_channels = hidden_channels
+        self.persistence = persistence
+
+        # Simple MLP: channels -> hidden -> channels
+        self.message_mlp = nn.Sequential(
+            nn.Linear(channels, hidden_channels),
+            nn.ReLU(),
+            nn.Linear(hidden_channels, channels),
+            nn.ReLU()
+        )
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        """Reset learnable parameters."""
+        for module in self.message_mlp:
+            if hasattr(module, 'reset_parameters'):
+                module.reset_parameters()
+
+    def forward(self, x: Tensor, edge_index: Adj) -> Tensor:
+        """Forward pass."""
+        x_orig = x if self.persistence else None
+        out = self.propagate(edge_index, x=x)
+
+        if self.persistence:
+            out = torch.cat([x_orig, out], dim=-1)
+
+        return out
+
+    def message(self, x_j: Tensor) -> Tensor:
+        """Construct messages from neighbors."""
+        return self.message_mlp(x_j)
+
+    def __repr__(self) -> str:
+        return (
+            f'{self.__class__.__name__}('
+            f'{self.channels}, '
+            f'hidden_channels={self.hidden_channels}, '
+            f'persistence={self.persistence})'
         )
